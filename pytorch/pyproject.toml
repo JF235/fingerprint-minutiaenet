@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minutiaenet"
+version = "1.0.0"
+authors = [
+  { name="Dinh-Luan Nguyen" },
+  { name="Kai Cao" },
+  { name="Anil K. Jain" },
+]
+description = "Robust Minutiae Extractor: Integrating Deep Networks and Fingerprint Domain Knowledge (PyTorch)"
+
+[project.urls]
+Homepage = "https://github.com/luannd/MinutiaeNet"
+
+[project.scripts]
+minutiaenet = "minutiaenet.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]

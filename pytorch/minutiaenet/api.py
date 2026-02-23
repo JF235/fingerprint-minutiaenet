@@ -1,0 +1,584 @@
+import logging
+import os
+import glob
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
+import numpy as np
+from PIL import Image
+from tqdm import tqdm
+from datetime import timedelta
+import warnings
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+from .wrapper import MinutiaeNetWrapper, get_minutiaenet, postprocess
+from .mnet_utils import get_minutiaenet_logger, MnetTimer, DEFAULT_COARSENET_WEIGHTS_PATH, DEFAULT_FINENET_WEIGHTS_PATH
+
+logger = get_minutiaenet_logger('minutiaenet.api', level=logging.DEBUG)
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+
+class FingerprintDataset(Dataset):
+    """Dataset for loading fingerprint images."""
+
+    def __init__(self, image_paths: list[str], max_dim: int):
+        self.image_paths = image_paths
+        self.max_dim = max_dim
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        try:
+            img_pil = Image.open(img_path).convert("L")
+
+            if img_pil.height > self.max_dim or img_pil.width > self.max_dim:
+                logger.warning(
+                    f"Image {os.path.basename(img_path)} with size {img_pil.size} "
+                    f"exceeds max_dim of {self.max_dim}. Resizing."
+                )
+                img_pil.thumbnail(
+                    (self.max_dim, self.max_dim), Image.Resampling.LANCZOS
+                )
+
+            img_np = np.array(img_pil, dtype=np.float32) / 255.0
+
+            return {
+                "image": torch.from_numpy(img_np).unsqueeze(0),
+                "path": img_path,
+                "original_shape": img_np.shape,
+            }
+        except Exception as e:
+            logger.warning(f"Could not load image {img_path}. Skipping. Error: {e}")
+            return None
+
+
+def find_image_paths(input_path: str, recursive: bool = False) -> list[str]:
+    """Find all image paths from input."""
+    image_paths = []
+
+    if os.path.isfile(input_path):
+        _, ext = os.path.splitext(input_path)
+        if ext.lower() in [".txt", ".list"]:
+            with open(input_path, "r") as f:
+                for line in f:
+                    path = line.strip()
+                    if path:
+                        image_paths.append(path)
+        else:
+            single_supported = [".png", ".wsq", ".bmp", ".jpg", ".jpeg", ".tif", ".tiff"]
+            if ext.lower() in single_supported:
+                image_paths.append(input_path)
+            else:
+                raise ValueError(
+                    f"Only {single_supported} files are supported (received: {input_path})"
+                )
+    elif os.path.isdir(input_path):
+        extensions = ["png", "bmp", "jpg", "jpeg", "tif", "tiff"]
+        for ext in extensions:
+            pattern = (
+                f"{input_path}/**/*.{ext}" if recursive else f"{input_path}/*.{ext}"
+            )
+            image_paths.extend(glob.glob(pattern, recursive=recursive))
+    else:
+        raise ValueError(f"Input path does not exist: {input_path}")
+
+    if not image_paths:
+        raise ValueError(f"No images found in: {input_path}")
+
+    return sorted(image_paths)
+
+
+def dynamic_padding_collate(batch):
+    """Custom collate that pads images to the max size within a batch."""
+    batch = [item for item in batch if item is not None]
+    if not batch:
+        return None, None, None
+
+    max_h = max(item["image"].shape[1] for item in batch)
+    max_w = max(item["image"].shape[2] for item in batch)
+
+    images, paths, orig_shapes = [], [], []
+    for item in batch:
+        img = item["image"]
+        _, h, w = img.shape
+        padding = (0, max_w - w, 0, max_h - h)
+        padded_img = torch.nn.functional.pad(img, padding, mode="constant", value=1.0)
+
+        images.append(padded_img)
+        paths.append(item["path"])
+        orig_shapes.append(item["original_shape"])
+
+    batch_tensors = torch.stack(images)
+    batch_paths = paths
+    batch_orig_shapes = (
+        torch.tensor([s[0] for s in orig_shapes]),
+        torch.tensor([s[1] for s in orig_shapes]),
+    )
+
+    return batch_tensors, batch_paths, batch_orig_shapes
+
+
+def save_results(result_item: dict, output_path: str, mnt_degrees: bool = False,
+                 input_base_path: str = None):
+    """Save inference results to disk."""
+    input_path = result_item["input_path"]
+
+    if input_base_path and os.path.isdir(input_base_path):
+        rel_path = os.path.relpath(input_path, input_base_path)
+        rel_dir = os.path.dirname(rel_path)
+        original_filename = os.path.basename(rel_path)
+    else:
+        rel_dir = ""
+        original_filename = os.path.basename(input_path)
+
+    base_name = os.path.splitext(original_filename)[0]
+
+    # Save minutiae (.txt)
+    minutiae = result_item["minutiae"].copy()
+    if mnt_degrees:
+        minutiae[:, 2] = np.round(np.rad2deg(minutiae[:, 2]), 2)
+
+    minutiae_path = os.path.join(output_path, "minutiae", rel_dir, f"{base_name}.txt")
+    os.makedirs(os.path.dirname(minutiae_path), exist_ok=True)
+    np.savetxt(
+        minutiae_path, minutiae,
+        fmt=["%.0f", "%.0f", "%.6f", "%.6f"],
+        header="x, y, angle, score", delimiter=","
+    )
+
+    # Save enhanced image
+    enhanced_path = os.path.join(output_path, "enhanced", rel_dir, original_filename)
+    os.makedirs(os.path.dirname(enhanced_path), exist_ok=True)
+    Image.fromarray(result_item["enhanced_image"]).save(enhanced_path)
+
+    # Save mask
+    mask_path = os.path.join(output_path, "mask", rel_dir, original_filename)
+    os.makedirs(os.path.dirname(mask_path), exist_ok=True)
+    Image.fromarray(result_item["segmentation_mask"]).save(mask_path)
+
+    # Save orientation field (encoded as PNG)
+    ori_cpu = result_item["orientation_field"]
+    orientation_path = os.path.join(output_path, "ori", rel_dir, original_filename)
+    os.makedirs(os.path.dirname(orientation_path), exist_ok=True)
+    angles_deg_shifted = np.round(np.rad2deg(ori_cpu) + 90).astype(np.uint8)
+    Image.fromarray(angles_deg_shifted).save(orientation_path)
+
+    if 'quality_mask' in result_item:
+        qmask_path = os.path.join(output_path, "quality_mask", rel_dir, original_filename)
+        os.makedirs(os.path.dirname(qmask_path), exist_ok=True)
+        Image.fromarray(result_item["quality_mask"]).save(qmask_path)
+
+    if 'enhanced_image_unmod' in result_item:
+        path = os.path.join(output_path, "enhanced_unmod", rel_dir, original_filename)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        Image.fromarray(result_item["enhanced_image_unmod"]).save(path)
+
+    if 'orientation_field_unmod' in result_item:
+        path = os.path.join(output_path, "ori_unmod", rel_dir, original_filename)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        angles = np.round(np.rad2deg(result_item["orientation_field_unmod"]) + 90).astype(np.uint8)
+        Image.fromarray(angles).save(path)
+
+    if 'minutiae_unmod' in result_item:
+        mnt_unmod = result_item["minutiae_unmod"].copy()
+        if mnt_degrees:
+            mnt_unmod[:, 2] = np.round(np.rad2deg(mnt_unmod[:, 2]), 2)
+        mnt_unmod_path = os.path.join(output_path, "minutiae_unmod", rel_dir, f"{base_name}.txt")
+        os.makedirs(os.path.dirname(mnt_unmod_path), exist_ok=True)
+        np.savetxt(
+            mnt_unmod_path, mnt_unmod,
+            fmt=["%.0f", "%.0f", "%.6f", "%.6f"],
+            header="x, y, angle, score", delimiter=","
+        )
+
+
+def postprocess_and_save_batch(
+    raw_outputs_cpu: dict,
+    batch_paths: list[str],
+    batch_orig_shapes: tuple,
+    padded_shape: tuple,
+    output_path: str,
+    mnt_degrees: bool,
+    input_base_path: str = None,
+    quality_mask: bool = False,
+    unmodulated: bool = False,
+):
+    """Post-process and save results for a batch."""
+    worker_id = threading.get_ident()
+    logger.info("CPU worker started processing batch",
+                extra={'cpu_worker_id': worker_id, 'first_image': os.path.basename(batch_paths[0])})
+    try:
+        with MnetTimer("Post-processing", logger):
+            final_outputs = postprocess(raw_outputs_cpu, threshold=0.45,
+                                        quality_mask=quality_mask, unmodulated=unmodulated)
+
+        for i in range(len(batch_paths)):
+            orig_h, orig_w = batch_orig_shapes[0][i].item(), batch_orig_shapes[1][i].item()
+
+            minutiae = final_outputs["minutiae"][i].numpy()
+            enhanced_img = final_outputs["enhanced_image"][i][:orig_h, :orig_w].numpy()
+            seg_mask = final_outputs["segmentation_mask"][i][:orig_h, :orig_w].numpy()
+            ori_field = final_outputs["orientation_field"][i][:orig_h, :orig_w].numpy()
+
+            result_item = {
+                "input_path": batch_paths[i],
+                "minutiae": minutiae,
+                "enhanced_image": enhanced_img,
+                "segmentation_mask": seg_mask,
+                "orientation_field": ori_field,
+            }
+
+            if quality_mask:
+                result_item["quality_mask"] = final_outputs["quality_mask"][i][:orig_h, :orig_w].numpy()
+            if unmodulated:
+                result_item["enhanced_image_unmod"] = final_outputs["enhanced_image_unmod"][i][:orig_h, :orig_w].numpy()
+                result_item["orientation_field_unmod"] = final_outputs["orientation_field_unmod"][i][:orig_h, :orig_w].numpy()
+                result_item["minutiae_unmod"] = final_outputs["minutiae_unmod"][i].numpy()
+
+            save_results(result_item, output_path, mnt_degrees, input_base_path)
+
+        logger.info("CPU worker finished batch",
+                    extra={'cpu_worker_id': worker_id, 'batch_size': len(batch_paths)})
+    except Exception as e:
+        warnings.warn(f"Failed post-processing batch starting with {os.path.basename(batch_paths[0])}. Error: {e}")
+
+
+def create_output_directories(output_path: str, quality_mask: bool = False, unmodulated: bool = False):
+    os.makedirs(os.path.join(output_path, "minutiae"), exist_ok=True)
+    os.makedirs(os.path.join(output_path, "mask"), exist_ok=True)
+    os.makedirs(os.path.join(output_path, "enhanced"), exist_ok=True)
+    os.makedirs(os.path.join(output_path, "ori"), exist_ok=True)
+    if quality_mask:
+        os.makedirs(os.path.join(output_path, "quality_mask"), exist_ok=True)
+    if unmodulated:
+        os.makedirs(os.path.join(output_path, "enhanced_unmod"), exist_ok=True)
+        os.makedirs(os.path.join(output_path, "ori_unmod"), exist_ok=True)
+        os.makedirs(os.path.join(output_path, "minutiae_unmod"), exist_ok=True)
+
+
+def setup_ddp(rank: int, world_size: int, gpu_id: int, timeout_minutes: int = 30):
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12355"
+    torch.cuda.set_device(gpu_id)
+    dist.init_process_group(
+        backend="nccl",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(minutes=timeout_minutes),
+        device_id=torch.device(f"cuda:{gpu_id}"),
+    )
+
+
+def cleanup_ddp():
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def _ddp_launch_target(rank: int, world_size: int, gpu_ids: list[int], config: dict):
+    gpu_id = gpu_ids[rank]
+    runner = InferenceRunner(config)
+    runner.setup(rank, world_size, gpu_id)
+    runner.run()
+
+
+def run_inference(
+    input_path: str,
+    output_path: str,
+    coarsenet_weights: str = DEFAULT_COARSENET_WEIGHTS_PATH,
+    finenet_weights: str | None = None,
+    gpus: int | list[int] | None = None,
+    batch_size: int = 4,
+    num_workers: int = 4,
+    recursive: bool = False,
+    mnt_degrees: bool = True,
+    compile_model: bool = False,
+    max_image_dim: int = 1024,
+    strategy: str = 'hybrid',
+    num_cpu_workers: int = 4,
+    quality_mask: bool = False,
+    unmodulated: bool = False,
+    full: bool = False,
+    use_finenet: bool = False,
+):
+    """
+    Run MinutiaeNet inference on images.
+
+    Args:
+        input_path: Path to image, directory, or text file with image paths
+        output_path: Directory to save results
+        coarsenet_weights: Path to CoarseNet weights (.pth file)
+        finenet_weights: Path to FineNet weights (.pth file), optional
+        gpus: GPU configuration (None/0: CPU, int: N GPUs, list: specific GPU IDs)
+        batch_size: Batch size per GPU
+        num_workers: Number of data loading workers per GPU
+        recursive: Search for images recursively
+        mnt_degrees: Save minutiae angles in degrees
+        compile_model: Use torch.compile
+        max_image_dim: Max dimension before resizing
+        strategy: 'hybrid' or 'full_gpu'
+        num_cpu_workers: CPU threads for post-processing
+        quality_mask: Export continuous quality mask
+        unmodulated: Export unmodulated outputs
+        full: Export all outputs
+        use_finenet: Use FineNet for minutiae verification
+    """
+    if full:
+        quality_mask = True
+        unmodulated = True
+
+    image_paths = find_image_paths(input_path, recursive)
+
+    if os.path.isdir(input_path):
+        input_base_path = input_path
+    elif os.path.isfile(input_path):
+        input_base_path = os.path.dirname(input_path)
+    else:
+        input_base_path = None
+
+    config = locals()
+
+    use_cpu = (gpus is None or gpus == 0 or not torch.cuda.is_available())
+    is_ddp = isinstance(gpus, int) and gpus > 1 or isinstance(gpus, list)
+
+    if use_cpu:
+        logger.info("Starting Inference on CPU")
+        runner = InferenceRunner(config)
+        runner.setup()
+        runner.run()
+
+    elif is_ddp:
+        gpu_ids = list(range(gpus)) if isinstance(gpus, int) else gpus
+        world_size = len(gpu_ids)
+        logger.info(f"Starting Distributed Inference on {world_size} GPUs: {gpu_ids}")
+
+        mp.spawn(
+            _ddp_launch_target,
+            nprocs=world_size,
+            args=(world_size, gpu_ids, config),
+            join=True,
+        )
+    else:
+        gpu_id = 0 if gpus == 1 else gpus[0]
+        logger.info(f"Starting Inference on single GPU: {gpu_id}")
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        config['gpus'] = True
+        runner = InferenceRunner(config)
+        runner.setup()
+        runner.run()
+
+
+def _save_results_chunk(
+    results_chunk: list[dict],
+    output_path: str,
+    mnt_degrees: bool,
+    worker_rank: int = -1,
+    input_base_path: str = None,
+):
+    desc = f"Saving (Worker {worker_rank})" if worker_rank >= 0 else "Saving Results"
+    for result_item in results_chunk:
+        try:
+            save_results(result_item, output_path, mnt_degrees, input_base_path)
+        except Exception as e:
+            base_name = os.path.basename(result_item.get('input_path', 'unknown_file'))
+            logger.warning(f"Failed to save result for {base_name}. Error: {e}")
+
+
+class InferenceRunner:
+    def __init__(self, config: dict):
+        self.config = config
+        self.strategy = None
+        self.rank = -1
+        self.world_size = 1
+        self.device = "cpu"
+        self.is_main_process = True
+        self.model = None
+        self.dataloader = None
+
+    def setup(self, rank: int = -1, world_size: int = 1, gpu_id: int = 0):
+        self.rank = rank
+        self.world_size = world_size
+        self.is_main_process = (rank <= 0)
+
+        if self.world_size > 1:
+            setup_ddp(self.rank, self.world_size, gpu_id)
+            self.device = f"cuda:{gpu_id}"
+        elif self.config['gpus'] and torch.cuda.is_available():
+            self.device = "cuda:0"
+        else:
+            self.device = "cpu"
+
+        if self.is_main_process:
+            logger.info(f"Setting up runner on device: {self.device}")
+            create_output_directories(
+                self.config['output_path'],
+                quality_mask=self.config.get('quality_mask', False),
+                unmodulated=self.config.get('unmodulated', False),
+            )
+
+        if self.world_size > 1:
+            dist.barrier()
+
+        self.model = get_minutiaenet(
+            coarsenet_weights=self.config['coarsenet_weights'],
+            finenet_weights=self.config.get('finenet_weights'),
+            device=self.device,
+        )
+        if self.config['compile_model']:
+            if self.is_main_process:
+                logger.info("Compiling model with torch.compile...")
+            self.model = torch.compile(self.model)
+
+        dataset = FingerprintDataset(self.config['image_paths'], max_dim=self.config['max_image_dim'])
+        sampler = None
+        if self.world_size > 1:
+            sampler = DistributedSampler(
+                dataset, num_replicas=self.world_size, rank=self.rank, shuffle=False, drop_last=False
+            )
+
+        self.dataloader = DataLoader(
+            dataset,
+            batch_size=self.config['batch_size'],
+            sampler=sampler,
+            shuffle=False,
+            num_workers=self.config['num_workers'],
+            pin_memory=True,
+            persistent_workers=(self.config['num_workers'] > 0),
+            collate_fn=dynamic_padding_collate,
+        )
+
+        self.strategy = self.config['strategy']
+
+    def run(self):
+        if self.is_main_process:
+            logger.info(f"Executing with strategy: '{self.strategy}'")
+
+        if self.strategy == 'hybrid':
+            self._run_hybrid()
+        elif self.strategy == 'full_gpu':
+            self._run_full_gpu()
+        else:
+            raise ValueError(f"Unknown execution strategy: {self.strategy}")
+
+        if self.world_size > 1:
+            dist.barrier()
+            cleanup_ddp()
+
+        if self.is_main_process:
+            logger.info("Inference Complete!")
+
+    def _run_hybrid(self):
+        if self.is_main_process:
+            logger.info("Starting inference loop...")
+
+        num_cpu_workers = self.config['num_cpu_workers']
+
+        with ThreadPoolExecutor(max_workers=num_cpu_workers) as executor:
+            futures = []
+            max_queue_size = 2 * num_cpu_workers
+
+            with torch.no_grad():
+                desc = f"GPU {self.rank}" if self.world_size > 1 else "Processing"
+                iterator = tqdm(self.dataloader, desc=desc, disable=not self.is_main_process)
+
+                for batch_tensors, batch_paths, batch_orig_shapes in iterator:
+                    if batch_tensors is None:
+                        continue
+
+                    _, _, padded_h, padded_w = batch_tensors.shape
+                    batch_tensors = batch_tensors.to(self.device)
+                    raw_outputs = self.model.coarsenet(batch_tensors)
+
+                    raw_outputs_cpu = {k: v.detach().cpu() for k, v in raw_outputs.items()}
+
+                    future = executor.submit(
+                        postprocess_and_save_batch,
+                        raw_outputs_cpu, batch_paths, batch_orig_shapes,
+                        (padded_h, padded_w), self.config['output_path'], self.config['mnt_degrees'],
+                        self.config.get('input_base_path'),
+                        self.config.get('quality_mask', False),
+                        self.config.get('unmodulated', False),
+                    )
+                    futures.append(future)
+
+                    if len(futures) >= max_queue_size:
+                        futures.pop(0).result()
+
+            if self.is_main_process:
+                logger.info("Inference complete. Finalizing post-processing...")
+            for future in tqdm(futures, desc=f"Finalizing (Worker {self.rank})", disable=not self.is_main_process):
+                future.result()
+
+    def _run_full_gpu(self):
+        num_save_workers = self.config['num_cpu_workers']
+        chunk_size = self.config['batch_size'] * 10
+
+        with ThreadPoolExecutor(max_workers=num_save_workers) as save_executor:
+            futures = []
+            chunk_to_save = []
+
+            with torch.no_grad():
+                desc = f"GPU {self.rank}" if self.world_size > 1 else "Processing"
+                iterator = tqdm(self.dataloader, desc=desc, disable=not self.is_main_process)
+
+                for batch_tensors, batch_paths, batch_orig_shapes in iterator:
+                    if batch_tensors is None:
+                        continue
+
+                    batch_tensors = batch_tensors.to(self.device)
+                    _qm = self.config.get('quality_mask', False)
+                    _um = self.config.get('unmodulated', False)
+                    _uf = self.config.get('use_finenet', False)
+                    final_outputs = self.model(batch_tensors, quality_mask=_qm, unmodulated=_um, use_finenet=_uf)
+
+                    for i in range(len(batch_paths)):
+                        orig_h, orig_w = batch_orig_shapes[0][i].item(), batch_orig_shapes[1][i].item()
+                        result_item = {
+                            'input_path': batch_paths[i],
+                            'minutiae': final_outputs['minutiae'][i].cpu().numpy(),
+                            'enhanced_image': final_outputs['enhanced_image'][i][:orig_h, :orig_w].cpu().numpy(),
+                            'segmentation_mask': final_outputs['segmentation_mask'][i][:orig_h, :orig_w].cpu().numpy(),
+                            'orientation_field': final_outputs['orientation_field'][i][:orig_h, :orig_w].cpu().numpy(),
+                        }
+                        if _qm and 'quality_mask' in final_outputs:
+                            result_item['quality_mask'] = final_outputs['quality_mask'][i][:orig_h, :orig_w].cpu().numpy()
+                        if _um:
+                            result_item['enhanced_image_unmod'] = final_outputs['enhanced_image_unmod'][i][:orig_h, :orig_w].cpu().numpy()
+                            result_item['orientation_field_unmod'] = final_outputs['orientation_field_unmod'][i][:orig_h, :orig_w].cpu().numpy()
+                            result_item['minutiae_unmod'] = final_outputs['minutiae_unmod'][i].cpu().numpy()
+                        chunk_to_save.append(result_item)
+
+                    if len(chunk_to_save) >= chunk_size:
+                        future = save_executor.submit(
+                            _save_results_chunk,
+                            chunk_to_save,
+                            self.config['output_path'],
+                            self.config['mnt_degrees'],
+                            self.rank,
+                            self.config.get('input_base_path'),
+                        )
+                        futures.append(future)
+                        chunk_to_save = []
+
+            if chunk_to_save:
+                future = save_executor.submit(
+                    _save_results_chunk,
+                    chunk_to_save,
+                    self.config['output_path'],
+                    self.config['mnt_degrees'],
+                    self.rank,
+                    self.config.get('input_base_path'),
+                )
+                futures.append(future)
+
+            if self.is_main_process:
+                logger.info("Inference complete. Waiting for save workers to finish...")
+
+            for future in tqdm(futures, desc=f"Finalizing Save (Worker {self.rank})", disable=not self.is_main_process):
+                future.result()
