@@ -1,4 +1,4 @@
-# MinutiaeNet (PyTorch)
++# MinutiaeNet (PyTorch)
 
 MinutiaeNet is a fully automatic minutiae extractor based on deep neural networks with compact feature representation for fast comparison of minutiae sets. It integrates deep networks and fingerprint domain knowledge for robust extraction, particularly on latent and poor-quality plain fingerprints.
 
@@ -62,5 +62,31 @@ run_inference(
 )
 ```
 
-## Examples
-See the `pytorch/examples/` directory for didactic notebooks demonstrating the inner workings of MinutiaeNet step-by-step.
+## Reproducing Results
+
+You can reproduce the original paper's results and compare them with the PyTorch refactor using the provided demo scripts.
+
+### 1. PyTorch Implementation (Python 3)
+The script `run_demo_new.py` provides a faithful reproduction of the original pipeline using PyTorch.
+
+*   **Script:** [run_demo_new.py](file:///home/joaocontreras/work/minutiaenet/run_demo_new.py)
+*   **Run:** `python run_demo_new.py`
+*   **Outputs:** Generated in `output_fine_new/` (includes FineNet refinement) or `output_new/` (standard).
+
+### 2. Original Keras Implementation (Python 2 + Docker)
+Because the original code requires a legacy environment, use the provided Docker container.
+
+*   **Setup:**
+    ```bash
+    docker build -t minutiaenet .
+    docker run -it -v $(pwd):/workspace minutiaenet bash
+    ```
+*   **Run (inside container):**
+    ```bash
+    cd Demo_notebooks
+    python run_demo_CoarseNet.py
+    ```
+*   **Outputs:** Generated in `output_fine_old/` (refined) or `output_old/` (standard).
+
+> [!NOTE]
+> To toggle **FineNet** refinement, edit `isHavingFineNet` in the Keras script or configure the `finenet_weights` and `_apply_finenet` call in the PyTorch script.

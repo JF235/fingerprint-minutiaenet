@@ -85,7 +85,7 @@ def show_orientation_field(img, dir_map, mask=None, fname=None):
 
 
 def main():
-    output_dir = 'output_new'
+    output_dir = 'output_fine_new'
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
@@ -98,6 +98,7 @@ def main():
 
     model = get_minutiaenet(
         coarsenet_weights='Models/CoarseNet.pth',
+        finenet_weights='Models/FineNet.pth',
         device=device
     )
 
@@ -130,6 +131,8 @@ def main():
 
             # ---- Post-processing (replicates Keras exactly) ----
             outputs = model.postprocess(raw_outputs, threshold=0.45)
+            # ---- FineNet refinement ----
+            outputs = model._apply_finenet(padded_x, outputs, threshold=0.45)
 
             minutiae_list = outputs['minutiae'][0].cpu().numpy()
             seg_out = outputs['segmentation_mask'][0].cpu().numpy()

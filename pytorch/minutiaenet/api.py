@@ -140,17 +140,23 @@ def save_results(result_item: dict, output_path: str, mnt_degrees: bool = False,
 
     base_name = os.path.splitext(original_filename)[0]
 
-    # Save minutiae (.txt)
+    # Save minutiae (.min) - padrão: ângulo CCW em graus (int), qualidade 0-100 (int)
     minutiae = result_item["minutiae"].copy()
-    if mnt_degrees:
-        minutiae[:, 2] = np.round(np.rad2deg(minutiae[:, 2]), 2)
+    angle_ccw_deg = np.round(np.rad2deg(minutiae[:, 2]) % 360).astype(int)
+    quality_int = np.round(minutiae[:, 3] * 100).astype(int)
+    minutiae_out = np.column_stack([
+        minutiae[:, 0].astype(int),
+        minutiae[:, 1].astype(int),
+        angle_ccw_deg,
+        quality_int,
+    ])
 
-    minutiae_path = os.path.join(output_path, "minutiae", rel_dir, f"{base_name}.txt")
+    minutiae_path = os.path.join(output_path, "minutiae", rel_dir, f"{base_name}.min")
     os.makedirs(os.path.dirname(minutiae_path), exist_ok=True)
     np.savetxt(
-        minutiae_path, minutiae,
-        fmt=["%.0f", "%.0f", "%.6f", "%.6f"],
-        header="x, y, angle, score", delimiter=","
+        minutiae_path, minutiae_out,
+        fmt="%d",
+        header="X Y ANGLE QUALITY", comments="#MIN ", delimiter=" "
     )
 
     # Save enhanced image
@@ -188,14 +194,20 @@ def save_results(result_item: dict, output_path: str, mnt_degrees: bool = False,
 
     if 'minutiae_unmod' in result_item:
         mnt_unmod = result_item["minutiae_unmod"].copy()
-        if mnt_degrees:
-            mnt_unmod[:, 2] = np.round(np.rad2deg(mnt_unmod[:, 2]), 2)
-        mnt_unmod_path = os.path.join(output_path, "minutiae_unmod", rel_dir, f"{base_name}.txt")
+        angle_ccw_deg_unmod = np.round(np.rad2deg(mnt_unmod[:, 2]) % 360).astype(int)
+        quality_int_unmod = np.round(mnt_unmod[:, 3] * 100).astype(int)
+        mnt_unmod_out = np.column_stack([
+            mnt_unmod[:, 0].astype(int),
+            mnt_unmod[:, 1].astype(int),
+            angle_ccw_deg_unmod,
+            quality_int_unmod,
+        ])
+        mnt_unmod_path = os.path.join(output_path, "minutiae_unmod", rel_dir, f"{base_name}.min")
         os.makedirs(os.path.dirname(mnt_unmod_path), exist_ok=True)
         np.savetxt(
-            mnt_unmod_path, mnt_unmod,
-            fmt=["%.0f", "%.0f", "%.6f", "%.6f"],
-            header="x, y, angle, score", delimiter=","
+            mnt_unmod_path, mnt_unmod_out,
+            fmt="%d",
+            header="X Y ANGLE QUALITY", comments="#MIN ", delimiter=" "
         )
 
 
@@ -263,16 +275,17 @@ def create_output_directories(output_path: str, quality_mask: bool = False, unmo
         os.makedirs(os.path.join(output_path, "minutiae_unmod"), exist_ok=True)
 
 
-def setup_ddp(rank: int, world_size: int, gpu_id: int, timeout_minutes: int = 30):
+def setup_ddp(rank: int, world_size: int, local_device_idx: int, timeout_minutes: int = 30):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "12355"
-    torch.cuda.set_device(gpu_id)
+    # CUDA_VISIBLE_DEVICES remaps selected physical GPUs to logical indices.
+    torch.cuda.set_device(local_device_idx)
     dist.init_process_group(
         backend="nccl",
         rank=rank,
         world_size=world_size,
         timeout=timedelta(minutes=timeout_minutes),
-        device_id=torch.device(f"cuda:{gpu_id}"),
+        device_id=torch.device(f"cuda:{local_device_idx}"),
     )
 
 
@@ -281,10 +294,10 @@ def cleanup_ddp():
         dist.destroy_process_group()
 
 
-def _ddp_launch_target(rank: int, world_size: int, gpu_ids: list[int], config: dict):
-    gpu_id = gpu_ids[rank]
+def _ddp_launch_target(rank: int, world_size: int, config: dict):
+    # With CUDA_VISIBLE_DEVICES already set, rank == logical CUDA index.
     runner = InferenceRunner(config)
-    runner.setup(rank, world_size, gpu_id)
+    runner.setup(rank, world_size, rank)
     runner.run()
 
 
@@ -315,7 +328,11 @@ def run_inference(
         output_path: Directory to save results
         coarsenet_weights: Path to CoarseNet weights (.pth file)
         finenet_weights: Path to FineNet weights (.pth file), optional
-        gpus: GPU configuration (None/0: CPU, int: N GPUs, list: specific GPU IDs)
+        gpus: GPU configuration:
+            - None or 0: Use CPU
+            - int (e.g., 1): Use first N GPUs (logical IDs 0..N-1 after remap)
+            - int (e.g., 2): Use 2 GPUs with DDP (logical IDs 0,1)
+            - list[int] (e.g., [2,3]): Select specific physical GPUs in CLI, then use logical 0,1
         batch_size: Batch size per GPU
         num_workers: Number of data loading workers per GPU
         recursive: Search for images recursively
@@ -345,7 +362,33 @@ def run_inference(
     config = locals()
 
     use_cpu = (gpus is None or gpus == 0 or not torch.cuda.is_available())
-    is_ddp = isinstance(gpus, int) and gpus > 1 or isinstance(gpus, list)
+    requested_world_size = 0
+    if not use_cpu:
+        if isinstance(gpus, int):
+            requested_world_size = gpus
+        elif isinstance(gpus, list):
+            requested_world_size = len(gpus)
+        else:
+            raise ValueError(f"Unsupported GPU configuration type: {type(gpus)}")
+
+    if not use_cpu:
+        visible_cuda_count = torch.cuda.device_count()
+        if requested_world_size > visible_cuda_count:
+            visible_names = []
+            for i in range(visible_cuda_count):
+                try:
+                    visible_names.append(f"cuda:{i}={torch.cuda.get_device_name(i)}")
+                except Exception:
+                    visible_names.append(f"cuda:{i}=<unavailable>")
+            visible_desc = ", ".join(visible_names) if visible_names else "<none>"
+            raise ValueError(
+                f"Requested {requested_world_size} GPU(s), but only {visible_cuda_count} "
+                f"visible to CUDA. CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')} | "
+                f"visible devices: {visible_desc}. "
+                "This usually means one or more requested GPU IDs are invalid for this host, "
+                "or a parent environment/scheduler already restricted visible GPUs."
+            )
+    is_ddp = (not use_cpu and requested_world_size > 1)
 
     if use_cpu:
         logger.info("Starting Inference on CPU")
@@ -354,23 +397,26 @@ def run_inference(
         runner.run()
 
     elif is_ddp:
-        gpu_ids = list(range(gpus)) if isinstance(gpus, int) else gpus
-        world_size = len(gpu_ids)
-        logger.info(f"Starting Distributed Inference on {world_size} GPUs: {gpu_ids}")
+        world_size = requested_world_size
+        logger.info(
+            f"Starting Distributed Inference on {world_size} logical GPU(s). "
+            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}"
+        )
 
         mp.spawn(
             _ddp_launch_target,
             nprocs=world_size,
-            args=(world_size, gpu_ids, config),
+            args=(world_size, config),
             join=True,
         )
     else:
-        gpu_id = 0 if gpus == 1 else gpus[0]
-        logger.info(f"Starting Inference on single GPU: {gpu_id}")
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        logger.info(
+            "Starting Inference on single logical GPU (cuda:0). "
+            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}"
+        )
         config['gpus'] = True
         runner = InferenceRunner(config)
-        runner.setup()
+        runner.setup(rank=-1, world_size=1, gpu_id=0)
         runner.run()
 
 

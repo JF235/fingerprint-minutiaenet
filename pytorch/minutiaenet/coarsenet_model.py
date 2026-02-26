@@ -183,34 +183,7 @@ class OrientationSegmentationHead(nn.Module):
         return ori_out, seg_out
 
 
-def _gabor_fn(ksize, sigma, theta, Lambda, psi, gamma):
-    sigma_x = sigma
-    sigma_y = float(sigma) / gamma
-    xmax = ksize[0] / 2
-    ymax = ksize[1] / 2
-    xmin = -xmax
-    ymin = -ymax
-    (y, x) = np.meshgrid(np.arange(ymin, ymax + 1), np.arange(xmin, xmax + 1))
-    x_theta = x * np.cos(theta) + y * np.sin(theta)
-    y_theta = -x * np.sin(theta) + y * np.cos(theta)
-    gb_cos = np.exp(-.5 * (x_theta ** 2 / sigma_x ** 2 + y_theta ** 2 / sigma_y ** 2)) * np.cos(2 * np.pi / Lambda * x_theta + psi)
-    gb_sin = np.exp(-.5 * (x_theta ** 2 / sigma_x ** 2 + y_theta ** 2 / sigma_y ** 2)) * np.sin(2 * np.pi / Lambda * x_theta + psi)
-    return gb_cos, gb_sin
 
-def _gabor_bank(stride=2, Lambda=8):
-    filters_cos = np.ones([25, 25, int(180 / stride)], dtype=float)
-    filters_sin = np.ones([25, 25, int(180 / stride)], dtype=float)
-    for n, i in enumerate(range(-90, 90, stride)):
-        theta = i * np.pi / 180.
-        kernel_cos, kernel_sin = _gabor_fn((24, 24), 4.5, -theta, Lambda, 0, 0.5)
-        filters_cos[..., n] = kernel_cos
-        filters_sin[..., n] = kernel_sin
-    filters_cos = np.reshape(filters_cos, [25, 25, 1, -1])
-    filters_sin = np.reshape(filters_sin, [25, 25, 1, -1])
-    # PyTorch expects out_channels, in_channels, kH, kW
-    filters_cos = np.transpose(filters_cos, (3, 2, 0, 1))
-    filters_sin = np.transpose(filters_sin, (3, 2, 0, 1))
-    return filters_cos, filters_sin
 
 
 class EnhancementModule(nn.Module):
@@ -219,12 +192,6 @@ class EnhancementModule(nn.Module):
         super().__init__()
         self.gabor_real = nn.Conv2d(1, 90, 25, padding='same', bias=True)
         self.gabor_imag = nn.Conv2d(1, 90, 25, padding='same', bias=True)
-
-        filters_cos, filters_sin = _gabor_bank(stride=2, Lambda=8)
-        self.gabor_real.weight.data = torch.from_numpy(filters_cos).float()
-        self.gabor_imag.weight.data = torch.from_numpy(filters_sin).float()
-        self.gabor_real.bias.data.fill_(0.0)
-        self.gabor_imag.bias.data.fill_(0.0)
 
         # Pre-compute circular gaussian kernel for orientation peak detection
         length = 180
@@ -237,6 +204,8 @@ class EnhancementModule(nn.Module):
         delta = np.minimum(delta, length - delta) + length // 2
         glabel = gaussian_pdf[delta].astype(np.float32)
         self.register_buffer('glabel_tensor', torch.from_numpy(glabel).permute(2, 3, 0, 1))
+
+
 
     def _ori_highest_peak(self, y_pred):
         return F.conv2d(y_pred, self.glabel_tensor, padding='same')
@@ -486,6 +455,7 @@ def get_coarsenet_core(
 
     logger.info(f"Loading weights from: {weights_path}")
     model.load_state_dict(torch.load(weights_path, map_location=device))
+    
     model.eval()
     model.to(device)
 

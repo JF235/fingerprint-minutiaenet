@@ -130,6 +130,7 @@ def plot_from_output_folder(
     save_path: str | None = None,
     stride: int = 16,
     degrees: bool = False,
+    input_path: str | None = None,
 ):
     """Plot results from output folder structure."""
     print(f"INFO: Generating visualization for '{image_filename}' from '{output_path}'...")
@@ -156,7 +157,7 @@ def plot_from_output_folder(
 
     enhanced_path = find_file_by_dir_patterns(output_path, enhanced_dirs, image_basename)
     orientation_path = find_file_by_dir_patterns(output_path, orientation_dirs, image_basename)
-    minutiae_path = find_file_by_dir_patterns(output_path, minutiae_dirs, f"{base_name}.txt")
+    minutiae_path = find_file_by_dir_patterns(output_path, minutiae_dirs, f"{base_name}.min")
 
     for name, path in (('enhanced', enhanced_path), ('orientation', orientation_path), ('minutiae', minutiae_path)):
         if path is None:
@@ -166,28 +167,32 @@ def plot_from_output_folder(
             print(f"ERROR: Required file not found: {path}")
             return
 
-    enhanced_image = np.array(Image.open(enhanced_path).convert('L'))
+    if input_path is not None:
+        display_image = np.array(Image.open(input_path).convert('L'))
+    else:
+        display_image = np.array(Image.open(enhanced_path).convert('L'))
     orientation_img = np.array(Image.open(orientation_path))
     orientation_field = np.deg2rad(orientation_img.astype(np.float32) - 90.0)
 
-    minutiae = np.loadtxt(minutiae_path, delimiter=',', skiprows=1)
+    minutiae = np.loadtxt(minutiae_path, comments='#')
     if minutiae.ndim == 1 and minutiae.size > 0:
         minutiae = np.expand_dims(minutiae, 0)
     elif minutiae.size == 0:
         minutiae = np.empty((0, 4))
 
+    # Converte ângulo do padrão .min (CCW graus) para CCW radianos (convenção da minutiaenet)
+    minutiae[:, 2] = np.deg2rad(minutiae[:, 2])
+
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
 
-    plot_img(axes[0], enhanced_image)
-    axes[0].set_title("Enhanced Image")
+    plot_img(axes[0], display_image)
+    axes[0].set_title("Enhanced Image" if input_path is None else "Original Image")
 
-    plot_img(axes[1], enhanced_image)
+    plot_img(axes[1], display_image)
     plot_ori_field(axes[1], orientation_field, stride=stride)
     axes[1].set_title(f"Orientation Field (Stride: {stride})")
 
-    plot_img(axes[2], enhanced_image)
-    if degrees:
-        minutiae[:, 2] = np.deg2rad(minutiae[:, 2])
+    plot_img(axes[2], display_image)
     plot_mnt(axes[2], minutiae)
     axes[2].set_title(f"Detected Minutiae ({len(minutiae)})")
 
