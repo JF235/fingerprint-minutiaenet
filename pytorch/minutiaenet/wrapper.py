@@ -9,6 +9,7 @@ from .mnet_utils import (
 )
 import os
 import numpy as np
+import time
 
 logger = get_minutiaenet_logger(__name__, level=logging.INFO)
 
@@ -420,22 +421,36 @@ def _post_detect_minutiae(outputs: dict, cleaned_mask: torch.Tensor, threshold: 
 
 
 def postprocess(outputs: dict, threshold: float,
-                quality_mask: bool = False, unmodulated: bool = False) -> dict[str, torch.Tensor]:
+                quality_mask: bool = False, unmodulated: bool = False,
+                return_timings: bool = False):
+    timings = {
+        'mask_ms': 0.0,
+        'minutiae_ms': 0.0,
+        'orientation_ms': 0.0,
+        'enhanced_ms': 0.0,
+        'optional_ms': 0.0,
+    }
+
     # 1. Binarize and clean segmentation mask
+    t0 = time.perf_counter()
     cleaned_mask = _post_binarize_mask_cv2(outputs['segmentation'])
     cleaned_mask_up = F.interpolate(
         cleaned_mask.unsqueeze(1).float(),
         scale_factor=8, mode='nearest'
     ).squeeze(1)
+    timings['mask_ms'] = (time.perf_counter() - t0) * 1000.0
 
     # 2. Minutiae detection (including NMS)
+    t1 = time.perf_counter()
     if unmodulated:
         final_minutiae_list, final_minutiae_unmod_list = _post_detect_minutiae(
             outputs, cleaned_mask, threshold, unmodulated=True)
     else:
         final_minutiae_list = _post_detect_minutiae(outputs, cleaned_mask, threshold)
+    timings['minutiae_ms'] = (time.perf_counter() - t1) * 1000.0
 
     # 3. Orientation field processing
+    t2 = time.perf_counter()
     ori = outputs['orientation']
     ori_idx = torch.argmax(ori, dim=1)
     ori_idx_up = F.interpolate(
@@ -444,8 +459,10 @@ def postprocess(outputs: dict, threshold: float,
     ).squeeze(1)
     orientation_field_raw = (ori_idx_up * 2.0 - 89.) * torch.pi / 180.0
     orientation_field = orientation_field_raw * cleaned_mask_up
+    timings['orientation_ms'] = (time.perf_counter() - t2) * 1000.0
 
     # 4. Enhanced image processing
+    t3 = time.perf_counter()
     enh_real = outputs['enhanced_real'].squeeze(1)
     enh_real_raw = enh_real
     enh_real = enh_real * cleaned_mask_up
@@ -457,6 +474,7 @@ def postprocess(outputs: dict, threshold: float,
     enh_max = enh_flat.max(dim=1, keepdim=True)[0]
     enh_norm = (enh_flat - enh_min) / (enh_max - enh_min + 1e-8)
     enh_visual = (enh_norm.view(b, h, w) * 255).byte()
+    timings['enhanced_ms'] = (time.perf_counter() - t3) * 1000.0
 
     result = {
         'minutiae': final_minutiae_list,
@@ -471,6 +489,7 @@ def postprocess(outputs: dict, threshold: float,
         ).squeeze(1)
         result['quality_mask'] = (seg_continuous_up * 255).byte()
 
+    t4 = time.perf_counter()
     if unmodulated:
         result['orientation_field_unmod'] = orientation_field_raw
         result['minutiae_unmod'] = final_minutiae_unmod_list
@@ -479,5 +498,9 @@ def postprocess(outputs: dict, threshold: float,
         enh_max_raw = enh_flat_raw.max(dim=1, keepdim=True)[0]
         enh_norm_raw = (enh_flat_raw - enh_min_raw) / (enh_max_raw - enh_min_raw + 1e-8)
         result['enhanced_image_unmod'] = (enh_norm_raw.view(b, h, w) * 255).byte()
+    timings['optional_ms'] = (time.perf_counter() - t4) * 1000.0
+
+    if return_timings:
+        return result, timings
 
     return result

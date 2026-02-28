@@ -32,6 +32,11 @@ def _init_profile_metrics() -> dict[str, deque]:
         'h2d_ms': deque(maxlen=window),
         'coarse_gpu_ms': deque(maxlen=window),
         'post_cpu_ms': deque(maxlen=window),
+        'post_mask_ms': deque(maxlen=window),
+        'post_minutiae_ms': deque(maxlen=window),
+        'post_orientation_ms': deque(maxlen=window),
+        'post_enhanced_ms': deque(maxlen=window),
+        'post_optional_ms': deque(maxlen=window),
         'finenet_ms': deque(maxlen=window),
         'd2h_ms': deque(maxlen=window),
         'pack_ms': deque(maxlen=window),
@@ -53,6 +58,11 @@ def _update_profile_tqdm(iterator, metrics: dict[str, deque], queue_depth: int):
         'h2d': f"{_profile_avg(metrics, 'h2d_ms'):.1f}ms",
         'coarse': f"{_profile_avg(metrics, 'coarse_gpu_ms'):.1f}ms",
         'post': f"{_profile_avg(metrics, 'post_cpu_ms'):.1f}ms",
+        'p_msk': f"{_profile_avg(metrics, 'post_mask_ms'):.1f}ms",
+        'p_mnt': f"{_profile_avg(metrics, 'post_minutiae_ms'):.1f}ms",
+        'p_ori': f"{_profile_avg(metrics, 'post_orientation_ms'):.1f}ms",
+        'p_enh': f"{_profile_avg(metrics, 'post_enhanced_ms'):.1f}ms",
+        'p_opt': f"{_profile_avg(metrics, 'post_optional_ms'):.1f}ms",
         'fine': f"{_profile_avg(metrics, 'finenet_ms'):.1f}ms",
         'd2h': f"{_profile_avg(metrics, 'd2h_ms'):.1f}ms",
         'pack': f"{_profile_avg(metrics, 'pack_ms'):.1f}ms",
@@ -68,6 +78,11 @@ def _log_profile_summary(profile_name: str, metrics: dict[str, deque]):
         f"h2d={_profile_avg(metrics, 'h2d_ms'):.2f}ms",
         f"coarse_gpu={_profile_avg(metrics, 'coarse_gpu_ms'):.2f}ms",
         f"post_cpu={_profile_avg(metrics, 'post_cpu_ms'):.2f}ms",
+        f"post_mask={_profile_avg(metrics, 'post_mask_ms'):.2f}ms",
+        f"post_minutiae={_profile_avg(metrics, 'post_minutiae_ms'):.2f}ms",
+        f"post_orientation={_profile_avg(metrics, 'post_orientation_ms'):.2f}ms",
+        f"post_enhanced={_profile_avg(metrics, 'post_enhanced_ms'):.2f}ms",
+        f"post_optional={_profile_avg(metrics, 'post_optional_ms'):.2f}ms",
         f"finenet={_profile_avg(metrics, 'finenet_ms'):.2f}ms",
         f"d2h={_profile_avg(metrics, 'd2h_ms'):.2f}ms",
         f"pack={_profile_avg(metrics, 'pack_ms'):.2f}ms",
@@ -651,6 +666,11 @@ class InferenceRunner:
                         profile_metrics['h2d_ms'].append(h2d_ms)
                         profile_metrics['coarse_gpu_ms'].append(gpu_ms)
                         profile_metrics['post_cpu_ms'].append(0.0)
+                        profile_metrics['post_mask_ms'].append(0.0)
+                        profile_metrics['post_minutiae_ms'].append(0.0)
+                        profile_metrics['post_orientation_ms'].append(0.0)
+                        profile_metrics['post_enhanced_ms'].append(0.0)
+                        profile_metrics['post_optional_ms'].append(0.0)
                         profile_metrics['finenet_ms'].append(0.0)
                         profile_metrics['d2h_ms'].append(d2h_ms)
                         profile_metrics['pack_ms'].append(0.0)
@@ -726,7 +746,13 @@ class InferenceRunner:
                             coarse_gpu_ms = (t_coarse_done - t_coarse_end) * 1000.0
 
                         t_post_start = time.perf_counter()
-                        final_outputs = postprocess(raw_outputs, threshold=0.45, quality_mask=_qm, unmodulated=_um)
+                        final_outputs, post_breakdown = postprocess(
+                            raw_outputs,
+                            threshold=0.45,
+                            quality_mask=_qm,
+                            unmodulated=_um,
+                            return_timings=True,
+                        )
                         post_cpu_ms = (time.perf_counter() - t_post_start) * 1000.0
 
                         finenet_ms = 0.0
@@ -794,6 +820,11 @@ class InferenceRunner:
                         profile_metrics['h2d_ms'].append(h2d_ms)
                         profile_metrics['coarse_gpu_ms'].append(coarse_gpu_ms)
                         profile_metrics['post_cpu_ms'].append(post_cpu_ms)
+                        profile_metrics['post_mask_ms'].append(post_breakdown['mask_ms'])
+                        profile_metrics['post_minutiae_ms'].append(post_breakdown['minutiae_ms'])
+                        profile_metrics['post_orientation_ms'].append(post_breakdown['orientation_ms'])
+                        profile_metrics['post_enhanced_ms'].append(post_breakdown['enhanced_ms'])
+                        profile_metrics['post_optional_ms'].append(post_breakdown['optional_ms'])
                         profile_metrics['finenet_ms'].append(finenet_ms)
                         profile_metrics['d2h_ms'].append(0.0)
                         profile_metrics['pack_ms'].append(pack_ms)
