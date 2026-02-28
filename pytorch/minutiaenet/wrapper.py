@@ -255,11 +255,19 @@ def angle_delta(A, B, max_D=np.pi*2):
     return delta
 
 def distance_keras(y_true, y_pred, max_D=16, max_O=np.pi/6):
-    from scipy import spatial
     if y_true.shape[0] == 0 or y_pred.shape[0] == 0:
         return np.zeros((y_true.shape[0], y_pred.shape[0]), dtype=bool)
-    D = spatial.distance.cdist(y_true[:, :2], y_pred[:, :2], 'euclidean')
-    O = spatial.distance.cdist(np.reshape(y_true[:, 2], [-1, 1]), np.reshape(y_pred[:, 2], [-1, 1]), angle_delta)
+
+    xy_true = y_true[:, :2].astype(np.float32, copy=False)
+    xy_pred = y_pred[:, :2].astype(np.float32, copy=False)
+    diff = xy_true[:, None, :] - xy_pred[None, :, :]
+    D = np.sqrt(np.sum(diff * diff, axis=2, dtype=np.float32), dtype=np.float32)
+
+    a_true = y_true[:, 2].astype(np.float32, copy=False)[:, None]
+    a_pred = y_pred[:, 2].astype(np.float32, copy=False)[None, :]
+    O = np.abs(a_true - a_pred)
+    O = np.minimum(O, (2 * np.pi) - O)
+
     return (D<=max_D)*(O<=max_O)
 
 def nms_keras(mnt):
@@ -329,27 +337,27 @@ def fuse_nms_keras(mnt, mnt_set_2):
         keep_list[i+1:] = keep_list[i+1:]*(1-inrange[i, i+1:])
     return mnt_sort[keep_list.astype(bool), :]
 
-def label2mnt_keras(mnt_s_out, mnt_w_out, mnt_h_out, mnt_o_out, thresh=0.5):
-    from scipy import sparse
+def label2mnt_keras(mnt_s_out, mnt_w_out, mnt_h_out, mnt_o_out, thresh=0.5, precomputed_argmax=False):
     mnt_s_out = np.squeeze(mnt_s_out)
     mnt_w_out = np.squeeze(mnt_w_out)
     mnt_h_out = np.squeeze(mnt_h_out)
     mnt_o_out = np.squeeze(mnt_o_out)
     if mnt_s_out.ndim == 0:
         return np.zeros((0, 4))
-    
-    mnt_sparse = sparse.coo_matrix(mnt_s_out>thresh)
-    mnt_list = np.array(list(zip(mnt_sparse.row, mnt_sparse.col)), dtype=np.int32)
+
+    rows, cols = np.where(mnt_s_out > thresh)
+    mnt_list = np.column_stack((rows, cols)).astype(np.int32, copy=False)
     if mnt_list.shape[0] == 0:
         return np.zeros((0, 4))
 
-    mnt_w_out = np.argmax(mnt_w_out, axis=-1)
-    mnt_h_out = np.argmax(mnt_h_out, axis=-1)
-    mnt_o_out = np.argmax(mnt_o_out, axis=-1)
+    if not precomputed_argmax:
+        mnt_w_out = np.argmax(mnt_w_out, axis=-1)
+        mnt_h_out = np.argmax(mnt_h_out, axis=-1)
+        mnt_o_out = np.argmax(mnt_o_out, axis=-1)
 
     mnt_final = np.zeros((len(mnt_list), 4))
-    mnt_final[:, 0] = mnt_sparse.col*8 + mnt_w_out[mnt_list[:,0], mnt_list[:,1]]
-    mnt_final[:, 1] = mnt_sparse.row*8 + mnt_h_out[mnt_list[:,0], mnt_list[:,1]]
+    mnt_final[:, 0] = mnt_list[:, 1]*8 + mnt_w_out[mnt_list[:,0], mnt_list[:,1]]
+    mnt_final[:, 1] = mnt_list[:, 0]*8 + mnt_h_out[mnt_list[:,0], mnt_list[:,1]]
     mnt_final[:, 2] = (mnt_o_out[mnt_list[:,0], mnt_list[:,1]]*2-89.)/180*np.pi
     mnt_final[mnt_final[:, 2]<0.0, 2] = mnt_final[mnt_final[:, 2]<0.0, 2]+2*np.pi
     mnt_final[:, 2] = (-mnt_final[:, 2]) % (2*np.pi)
@@ -364,12 +372,23 @@ def _post_detect_minutiae_single_keras(mnt_s_out, mnt_w_out, mnt_h_out, mnt_o_ou
     mnt_o_out_np = mnt_o_out.permute(1, 2, 0).cpu().numpy()
     seg_out_np = seg_out.cpu().numpy()
 
+    mnt_w_idx = np.argmax(mnt_w_out_np, axis=-1)
+    mnt_h_idx = np.argmax(mnt_h_out_np, axis=-1)
+    mnt_o_idx = np.argmax(mnt_o_out_np, axis=-1)
+    score_map = mnt_s_out_np * seg_out_np
+
     final_minutiae_score_threashold = 0.45
     early_minutiae_thres = final_minutiae_score_threashold + 0.05
 
     while final_minutiae_score_threashold >= 0:
-        mnt = label2mnt_keras(mnt_s_out_np * seg_out_np, mnt_w_out_np, mnt_h_out_np, mnt_o_out_np,
-                        thresh=early_minutiae_thres)
+        mnt = label2mnt_keras(
+            score_map,
+            mnt_w_idx,
+            mnt_h_idx,
+            mnt_o_idx,
+            thresh=early_minutiae_thres,
+            precomputed_argmax=True,
+        )
 
         mnt_nms_1 = py_cpu_nms_keras(mnt, 0.5)
         mnt_nms_2 = nms_keras(mnt)
