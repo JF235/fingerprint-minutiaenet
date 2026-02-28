@@ -30,7 +30,9 @@ def _init_profile_metrics() -> dict[str, deque]:
     return {
         'load_ms': deque(maxlen=window),
         'h2d_ms': deque(maxlen=window),
-        'gpu_ms': deque(maxlen=window),
+        'coarse_gpu_ms': deque(maxlen=window),
+        'post_cpu_ms': deque(maxlen=window),
+        'finenet_ms': deque(maxlen=window),
         'd2h_ms': deque(maxlen=window),
         'pack_ms': deque(maxlen=window),
         'submit_ms': deque(maxlen=window),
@@ -49,7 +51,9 @@ def _update_profile_tqdm(iterator, metrics: dict[str, deque], queue_depth: int):
     iterator.set_postfix({
         'load': f"{_profile_avg(metrics, 'load_ms'):.1f}ms",
         'h2d': f"{_profile_avg(metrics, 'h2d_ms'):.1f}ms",
-        'gpu': f"{_profile_avg(metrics, 'gpu_ms'):.1f}ms",
+        'coarse': f"{_profile_avg(metrics, 'coarse_gpu_ms'):.1f}ms",
+        'post': f"{_profile_avg(metrics, 'post_cpu_ms'):.1f}ms",
+        'fine': f"{_profile_avg(metrics, 'finenet_ms'):.1f}ms",
         'd2h': f"{_profile_avg(metrics, 'd2h_ms'):.1f}ms",
         'pack': f"{_profile_avg(metrics, 'pack_ms'):.1f}ms",
         'submit': f"{_profile_avg(metrics, 'submit_ms'):.1f}ms",
@@ -62,7 +66,9 @@ def _log_profile_summary(profile_name: str, metrics: dict[str, deque]):
     parts = [
         f"load={_profile_avg(metrics, 'load_ms'):.2f}ms",
         f"h2d={_profile_avg(metrics, 'h2d_ms'):.2f}ms",
-        f"gpu={_profile_avg(metrics, 'gpu_ms'):.2f}ms",
+        f"coarse_gpu={_profile_avg(metrics, 'coarse_gpu_ms'):.2f}ms",
+        f"post_cpu={_profile_avg(metrics, 'post_cpu_ms'):.2f}ms",
+        f"finenet={_profile_avg(metrics, 'finenet_ms'):.2f}ms",
         f"d2h={_profile_avg(metrics, 'd2h_ms'):.2f}ms",
         f"pack={_profile_avg(metrics, 'pack_ms'):.2f}ms",
         f"submit={_profile_avg(metrics, 'submit_ms'):.2f}ms",
@@ -643,7 +649,9 @@ class InferenceRunner:
                     if profile_enabled and self.is_main_process:
                         profile_metrics['load_ms'].append(load_ms)
                         profile_metrics['h2d_ms'].append(h2d_ms)
-                        profile_metrics['gpu_ms'].append(gpu_ms)
+                        profile_metrics['coarse_gpu_ms'].append(gpu_ms)
+                        profile_metrics['post_cpu_ms'].append(0.0)
+                        profile_metrics['finenet_ms'].append(0.0)
                         profile_metrics['d2h_ms'].append(d2h_ms)
                         profile_metrics['pack_ms'].append(0.0)
                         profile_metrics['submit_ms'].append(submit_ms)
@@ -699,17 +707,47 @@ class InferenceRunner:
                     _qm = self.config.get('quality_mask', False)
                     _um = self.config.get('unmodulated', False)
                     _uf = self.config.get('use_finenet', False)
-                    final_outputs = self.model(batch_tensors, quality_mask=_qm, unmodulated=_um, use_finenet=_uf)
 
-                    if self.device.startswith("cuda"):
-                        ev_gpu_end.record()
-                        torch.cuda.synchronize(self.device)
-                        h2d_ms = ev_h2d_start.elapsed_time(ev_h2d_end)
-                        gpu_ms = ev_h2d_end.elapsed_time(ev_gpu_end)
+                    if profile_enabled:
+                        padded_tensors = self.model.preprocess(batch_tensors)
+
+                        if self.device.startswith("cuda"):
+                            ev_coarse_end = torch.cuda.Event(enable_timing=True)
+                            raw_outputs = self.model.coarsenet(padded_tensors)
+                            ev_coarse_end.record()
+                            torch.cuda.synchronize(self.device)
+                            h2d_ms = ev_h2d_start.elapsed_time(ev_h2d_end)
+                            coarse_gpu_ms = ev_h2d_end.elapsed_time(ev_coarse_end)
+                        else:
+                            t_coarse_end = time.perf_counter()
+                            raw_outputs = self.model.coarsenet(padded_tensors)
+                            t_coarse_done = time.perf_counter()
+                            h2d_ms = (t_h2d_end - t_h2d_start) * 1000.0
+                            coarse_gpu_ms = (t_coarse_done - t_coarse_end) * 1000.0
+
+                        t_post_start = time.perf_counter()
+                        final_outputs = postprocess(raw_outputs, threshold=0.45, quality_mask=_qm, unmodulated=_um)
+                        post_cpu_ms = (time.perf_counter() - t_post_start) * 1000.0
+
+                        finenet_ms = 0.0
+                        if _uf and self.model.finenet is not None:
+                            t_fine_start = time.perf_counter()
+                            final_outputs = self.model._apply_finenet(padded_tensors, final_outputs, threshold=0.45)
+                            finenet_ms = (time.perf_counter() - t_fine_start) * 1000.0
                     else:
-                        t_gpu_end = time.perf_counter()
-                        h2d_ms = (t_h2d_end - t_h2d_start) * 1000.0
-                        gpu_ms = (t_gpu_end - t_h2d_end) * 1000.0
+                        final_outputs = self.model(batch_tensors, quality_mask=_qm, unmodulated=_um, use_finenet=_uf)
+
+                        if self.device.startswith("cuda"):
+                            ev_gpu_end.record()
+                            torch.cuda.synchronize(self.device)
+                            h2d_ms = ev_h2d_start.elapsed_time(ev_h2d_end)
+                            coarse_gpu_ms = ev_h2d_end.elapsed_time(ev_gpu_end)
+                        else:
+                            t_gpu_end = time.perf_counter()
+                            h2d_ms = (t_h2d_end - t_h2d_start) * 1000.0
+                            coarse_gpu_ms = (t_gpu_end - t_h2d_end) * 1000.0
+                        post_cpu_ms = 0.0
+                        finenet_ms = 0.0
 
                     t_pack_start = time.perf_counter()
                     for i in range(len(batch_paths)):
@@ -754,7 +792,9 @@ class InferenceRunner:
                     if profile_enabled and self.is_main_process:
                         profile_metrics['load_ms'].append(load_ms)
                         profile_metrics['h2d_ms'].append(h2d_ms)
-                        profile_metrics['gpu_ms'].append(gpu_ms)
+                        profile_metrics['coarse_gpu_ms'].append(coarse_gpu_ms)
+                        profile_metrics['post_cpu_ms'].append(post_cpu_ms)
+                        profile_metrics['finenet_ms'].append(finenet_ms)
                         profile_metrics['d2h_ms'].append(0.0)
                         profile_metrics['pack_ms'].append(pack_ms)
                         profile_metrics['submit_ms'].append(submit_ms)
