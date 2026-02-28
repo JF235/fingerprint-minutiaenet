@@ -96,13 +96,13 @@ class MinutiaeNetWrapper(nn.Module):
     def _apply_finenet(self, original_image, post_outputs, threshold):
         """Apply FineNet refinement to filter false positives."""
         if self.finenet is None:
-            print("FINENET IS NONE IN WRAPPER!")
+            logger.warning("FineNet requested but not loaded; skipping refinement")
             return post_outputs
 
-        print("APPLYING FINENET...")
         device = next(self.finenet.parameters()).device
         batch_size = original_image.shape[0]
         patch_radius = 22
+        finenet_batch_size = 256
 
         for i in range(batch_size):
             minutiae = post_outputs['minutiae'][i]
@@ -110,7 +110,10 @@ class MinutiaeNetWrapper(nn.Module):
                 continue
 
             img = original_image[i, 0]  # (H, W)
-            refined_scores = []
+            coarse_scores = minutiae[:, 3]
+            refined_scores = coarse_scores.clone()
+            patch_tensors = []
+            patch_indices = []
 
             for j in range(minutiae.shape[0]):
                 x_coord = int(minutiae[j, 0].item())
@@ -124,26 +127,32 @@ class MinutiaeNetWrapper(nn.Module):
 
                 patch = img[y_begin:y_end, x_begin:x_end]
                 if patch.numel() == 0:
-                    refined_scores.append(minutiae[j, 3])
                     continue
 
                 # Resize to 224x224 and convert to 3-channel
                 patch = patch.unsqueeze(0).unsqueeze(0)  # (1, 1, h, w)
                 patch = F.interpolate(patch, size=(224, 224), mode='nearest')
                 patch = patch.expand(-1, 3, -1, -1)  # (1, 3, 224, 224)
-                
                 patch = patch * 255.0
+                patch_tensors.append(patch)
+                patch_indices.append(j)
 
+            if patch_tensors:
+                patch_batch = torch.cat(patch_tensors, dim=0).to(device)
+                patch_indices_tensor = torch.tensor(patch_indices, device=device, dtype=torch.long)
+
+                finenet_scores = []
                 with torch.no_grad():
-                    prob = self.finenet(patch)
-                    is_minutiae_prob = prob[0, 0]  # class 0 = minutiae
+                    for start in range(0, patch_batch.shape[0], finenet_batch_size):
+                        end = start + finenet_batch_size
+                        probs = self.finenet(patch_batch[start:end])
+                        finenet_scores.append(probs[:, 0])  # class 0 = minutiae
 
-                # Soft fusion: (4 * coarse_score + fine_score) / 5
-                coarse_score = minutiae[j, 3]
-                fused_score = (4 * coarse_score + is_minutiae_prob) / 5
-                refined_scores.append(fused_score)
+                finenet_scores = torch.cat(finenet_scores, dim=0)
+                refined_scores[patch_indices_tensor] = (
+                    4.0 * coarse_scores[patch_indices_tensor] + finenet_scores
+                ) / 5.0
 
-            refined_scores = torch.stack(refined_scores)
             minutiae[:, 3] = refined_scores
 
             # Filter by threshold after FineNet refinement

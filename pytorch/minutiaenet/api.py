@@ -1,6 +1,7 @@
 import logging
 import os
 import glob
+import time
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -12,6 +13,7 @@ from tqdm import tqdm
 from datetime import timedelta
 import warnings
 import threading
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
 from .wrapper import MinutiaeNetWrapper, get_minutiaenet, postprocess
@@ -21,6 +23,52 @@ logger = get_minutiaenet_logger('minutiaenet.api', level=logging.DEBUG)
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+
+
+def _init_profile_metrics() -> dict[str, deque]:
+    window = 30
+    return {
+        'load_ms': deque(maxlen=window),
+        'h2d_ms': deque(maxlen=window),
+        'gpu_ms': deque(maxlen=window),
+        'd2h_ms': deque(maxlen=window),
+        'pack_ms': deque(maxlen=window),
+        'submit_ms': deque(maxlen=window),
+        'queue_wait_ms': deque(maxlen=window),
+    }
+
+
+def _profile_avg(metrics: dict[str, deque], key: str) -> float:
+    values = metrics[key]
+    if not values:
+        return 0.0
+    return float(sum(values) / len(values))
+
+
+def _update_profile_tqdm(iterator, metrics: dict[str, deque], queue_depth: int):
+    iterator.set_postfix({
+        'load': f"{_profile_avg(metrics, 'load_ms'):.1f}ms",
+        'h2d': f"{_profile_avg(metrics, 'h2d_ms'):.1f}ms",
+        'gpu': f"{_profile_avg(metrics, 'gpu_ms'):.1f}ms",
+        'd2h': f"{_profile_avg(metrics, 'd2h_ms'):.1f}ms",
+        'pack': f"{_profile_avg(metrics, 'pack_ms'):.1f}ms",
+        'submit': f"{_profile_avg(metrics, 'submit_ms'):.1f}ms",
+        'wait': f"{_profile_avg(metrics, 'queue_wait_ms'):.1f}ms",
+        'q': queue_depth,
+    }, refresh=False)
+
+
+def _log_profile_summary(profile_name: str, metrics: dict[str, deque]):
+    parts = [
+        f"load={_profile_avg(metrics, 'load_ms'):.2f}ms",
+        f"h2d={_profile_avg(metrics, 'h2d_ms'):.2f}ms",
+        f"gpu={_profile_avg(metrics, 'gpu_ms'):.2f}ms",
+        f"d2h={_profile_avg(metrics, 'd2h_ms'):.2f}ms",
+        f"pack={_profile_avg(metrics, 'pack_ms'):.2f}ms",
+        f"submit={_profile_avg(metrics, 'submit_ms'):.2f}ms",
+        f"wait={_profile_avg(metrics, 'queue_wait_ms'):.2f}ms",
+    ]
+    logger.info(f"[{profile_name}] Profiling summary (moving average window=30): " + " | ".join(parts))
 
 
 class FingerprintDataset(Dataset):
@@ -142,7 +190,7 @@ def save_results(result_item: dict, output_path: str, mnt_degrees: bool = False,
 
     # Save minutiae (.min) - padrão: ângulo CCW em graus (int), qualidade 0-100 (int)
     minutiae = result_item["minutiae"].copy()
-    angle_ccw_deg = np.round(np.rad2deg(minutiae[:, 2]) % 360).astype(int)
+    angle_ccw_deg = np.round((-np.rad2deg(minutiae[:, 2])) % 360).astype(int)
     quality_int = np.round(minutiae[:, 3] * 100).astype(int)
     minutiae_out = np.column_stack([
         minutiae[:, 0].astype(int),
@@ -194,7 +242,7 @@ def save_results(result_item: dict, output_path: str, mnt_degrees: bool = False,
 
     if 'minutiae_unmod' in result_item:
         mnt_unmod = result_item["minutiae_unmod"].copy()
-        angle_ccw_deg_unmod = np.round(np.rad2deg(mnt_unmod[:, 2]) % 360).astype(int)
+        angle_ccw_deg_unmod = np.round((-np.rad2deg(mnt_unmod[:, 2])) % 360).astype(int)
         quality_int_unmod = np.round(mnt_unmod[:, 3] * 100).astype(int)
         mnt_unmod_out = np.column_stack([
             mnt_unmod[:, 0].astype(int),
@@ -319,6 +367,7 @@ def run_inference(
     unmodulated: bool = False,
     full: bool = False,
     use_finenet: bool = False,
+    profile: bool = False,
 ):
     """
     Run MinutiaeNet inference on images.
@@ -345,6 +394,7 @@ def run_inference(
         unmodulated: Export unmodulated outputs
         full: Export all outputs
         use_finenet: Use FineNet for minutiae verification
+        profile: Enable detailed stage profiling in tqdm/logs
     """
     if full:
         quality_mask = True
@@ -496,6 +546,7 @@ class InferenceRunner:
             num_workers=self.config['num_workers'],
             pin_memory=True,
             persistent_workers=(self.config['num_workers'] > 0),
+            prefetch_factor=(4 if self.config['num_workers'] > 0 else None),
             collate_fn=dynamic_padding_collate,
         )
 
@@ -524,6 +575,9 @@ class InferenceRunner:
             logger.info("Starting inference loop...")
 
         num_cpu_workers = self.config['num_cpu_workers']
+        profile_enabled = self.config.get('profile', False)
+        profile_metrics = _init_profile_metrics() if profile_enabled else None
+        prev_batch_end = time.perf_counter()
 
         with ThreadPoolExecutor(max_workers=num_cpu_workers) as executor:
             futures = []
@@ -534,15 +588,41 @@ class InferenceRunner:
                 iterator = tqdm(self.dataloader, desc=desc, disable=not self.is_main_process)
 
                 for batch_tensors, batch_paths, batch_orig_shapes in iterator:
+                    batch_loop_start = time.perf_counter()
+                    load_ms = (batch_loop_start - prev_batch_end) * 1000.0
+
                     if batch_tensors is None:
+                        prev_batch_end = time.perf_counter()
                         continue
 
                     _, _, padded_h, padded_w = batch_tensors.shape
-                    batch_tensors = batch_tensors.to(self.device)
-                    raw_outputs = self.model.coarsenet(batch_tensors)
 
+                    if self.device.startswith("cuda"):
+                        ev_h2d_start = torch.cuda.Event(enable_timing=True)
+                        ev_h2d_end = torch.cuda.Event(enable_timing=True)
+                        ev_gpu_end = torch.cuda.Event(enable_timing=True)
+                        ev_h2d_start.record()
+                        batch_tensors = batch_tensors.to(self.device, non_blocking=True)
+                        ev_h2d_end.record()
+                        raw_outputs = self.model.coarsenet(batch_tensors)
+                        ev_gpu_end.record()
+                        torch.cuda.synchronize(self.device)
+                        h2d_ms = ev_h2d_start.elapsed_time(ev_h2d_end)
+                        gpu_ms = ev_h2d_end.elapsed_time(ev_gpu_end)
+                    else:
+                        t_h2d_start = time.perf_counter()
+                        batch_tensors = batch_tensors.to(self.device, non_blocking=True)
+                        t_h2d_end = time.perf_counter()
+                        raw_outputs = self.model.coarsenet(batch_tensors)
+                        t_gpu_end = time.perf_counter()
+                        h2d_ms = (t_h2d_end - t_h2d_start) * 1000.0
+                        gpu_ms = (t_gpu_end - t_h2d_end) * 1000.0
+
+                    t_d2h_start = time.perf_counter()
                     raw_outputs_cpu = {k: v.detach().cpu() for k, v in raw_outputs.items()}
+                    d2h_ms = (time.perf_counter() - t_d2h_start) * 1000.0
 
+                    t_submit_start = time.perf_counter()
                     future = executor.submit(
                         postprocess_and_save_batch,
                         raw_outputs_cpu, batch_paths, batch_orig_shapes,
@@ -552,18 +632,41 @@ class InferenceRunner:
                         self.config.get('unmodulated', False),
                     )
                     futures.append(future)
+                    submit_ms = (time.perf_counter() - t_submit_start) * 1000.0
 
+                    queue_wait_ms = 0.0
                     if len(futures) >= max_queue_size:
+                        t_wait_start = time.perf_counter()
                         futures.pop(0).result()
+                        queue_wait_ms = (time.perf_counter() - t_wait_start) * 1000.0
+
+                    if profile_enabled and self.is_main_process:
+                        profile_metrics['load_ms'].append(load_ms)
+                        profile_metrics['h2d_ms'].append(h2d_ms)
+                        profile_metrics['gpu_ms'].append(gpu_ms)
+                        profile_metrics['d2h_ms'].append(d2h_ms)
+                        profile_metrics['pack_ms'].append(0.0)
+                        profile_metrics['submit_ms'].append(submit_ms)
+                        profile_metrics['queue_wait_ms'].append(queue_wait_ms)
+                        _update_profile_tqdm(iterator, profile_metrics, len(futures))
+
+                    prev_batch_end = time.perf_counter()
 
             if self.is_main_process:
                 logger.info("Inference complete. Finalizing post-processing...")
             for future in tqdm(futures, desc=f"Finalizing (Worker {self.rank})", disable=not self.is_main_process):
                 future.result()
 
+        if profile_enabled and self.is_main_process:
+            _log_profile_summary("hybrid", profile_metrics)
+
     def _run_full_gpu(self):
         num_save_workers = self.config['num_cpu_workers']
         chunk_size = self.config['batch_size'] * 10
+        profile_enabled = self.config.get('profile', False)
+        profile_metrics = _init_profile_metrics() if profile_enabled else None
+        prev_batch_end = time.perf_counter()
+        max_save_queue_size = 2 * num_save_workers
 
         with ThreadPoolExecutor(max_workers=num_save_workers) as save_executor:
             futures = []
@@ -574,15 +677,41 @@ class InferenceRunner:
                 iterator = tqdm(self.dataloader, desc=desc, disable=not self.is_main_process)
 
                 for batch_tensors, batch_paths, batch_orig_shapes in iterator:
+                    batch_loop_start = time.perf_counter()
+                    load_ms = (batch_loop_start - prev_batch_end) * 1000.0
+
                     if batch_tensors is None:
+                        prev_batch_end = time.perf_counter()
                         continue
 
-                    batch_tensors = batch_tensors.to(self.device)
+                    if self.device.startswith("cuda"):
+                        ev_h2d_start = torch.cuda.Event(enable_timing=True)
+                        ev_h2d_end = torch.cuda.Event(enable_timing=True)
+                        ev_gpu_end = torch.cuda.Event(enable_timing=True)
+                        ev_h2d_start.record()
+                        batch_tensors = batch_tensors.to(self.device, non_blocking=True)
+                        ev_h2d_end.record()
+                    else:
+                        t_h2d_start = time.perf_counter()
+                        batch_tensors = batch_tensors.to(self.device, non_blocking=True)
+                        t_h2d_end = time.perf_counter()
+
                     _qm = self.config.get('quality_mask', False)
                     _um = self.config.get('unmodulated', False)
                     _uf = self.config.get('use_finenet', False)
                     final_outputs = self.model(batch_tensors, quality_mask=_qm, unmodulated=_um, use_finenet=_uf)
 
+                    if self.device.startswith("cuda"):
+                        ev_gpu_end.record()
+                        torch.cuda.synchronize(self.device)
+                        h2d_ms = ev_h2d_start.elapsed_time(ev_h2d_end)
+                        gpu_ms = ev_h2d_end.elapsed_time(ev_gpu_end)
+                    else:
+                        t_gpu_end = time.perf_counter()
+                        h2d_ms = (t_h2d_end - t_h2d_start) * 1000.0
+                        gpu_ms = (t_gpu_end - t_h2d_end) * 1000.0
+
+                    t_pack_start = time.perf_counter()
                     for i in range(len(batch_paths)):
                         orig_h, orig_w = batch_orig_shapes[0][i].item(), batch_orig_shapes[1][i].item()
                         result_item = {
@@ -599,8 +728,11 @@ class InferenceRunner:
                             result_item['orientation_field_unmod'] = final_outputs['orientation_field_unmod'][i][:orig_h, :orig_w].cpu().numpy()
                             result_item['minutiae_unmod'] = final_outputs['minutiae_unmod'][i].cpu().numpy()
                         chunk_to_save.append(result_item)
+                    pack_ms = (time.perf_counter() - t_pack_start) * 1000.0
 
+                    submit_ms = 0.0
                     if len(chunk_to_save) >= chunk_size:
+                        t_submit_start = time.perf_counter()
                         future = save_executor.submit(
                             _save_results_chunk,
                             chunk_to_save,
@@ -610,7 +742,26 @@ class InferenceRunner:
                             self.config.get('input_base_path'),
                         )
                         futures.append(future)
+                        submit_ms = (time.perf_counter() - t_submit_start) * 1000.0
                         chunk_to_save = []
+
+                    queue_wait_ms = 0.0
+                    if len(futures) >= max_save_queue_size:
+                        t_wait_start = time.perf_counter()
+                        futures.pop(0).result()
+                        queue_wait_ms = (time.perf_counter() - t_wait_start) * 1000.0
+
+                    if profile_enabled and self.is_main_process:
+                        profile_metrics['load_ms'].append(load_ms)
+                        profile_metrics['h2d_ms'].append(h2d_ms)
+                        profile_metrics['gpu_ms'].append(gpu_ms)
+                        profile_metrics['d2h_ms'].append(0.0)
+                        profile_metrics['pack_ms'].append(pack_ms)
+                        profile_metrics['submit_ms'].append(submit_ms)
+                        profile_metrics['queue_wait_ms'].append(queue_wait_ms)
+                        _update_profile_tqdm(iterator, profile_metrics, len(futures))
+
+                    prev_batch_end = time.perf_counter()
 
             if chunk_to_save:
                 future = save_executor.submit(
@@ -628,3 +779,6 @@ class InferenceRunner:
 
             for future in tqdm(futures, desc=f"Finalizing Save (Worker {self.rank})", disable=not self.is_main_process):
                 future.result()
+
+        if profile_enabled and self.is_main_process:
+            _log_profile_summary("full_gpu", profile_metrics)

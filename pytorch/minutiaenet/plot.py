@@ -180,8 +180,8 @@ def plot_from_output_folder(
     elif minutiae.size == 0:
         minutiae = np.empty((0, 4))
 
-    # Converte ângulo do padrão .min (CCW graus) para CCW radianos (convenção da minutiaenet)
-    minutiae[:, 2] = np.deg2rad(minutiae[:, 2])
+    # Converte ângulo do padrão .min (CCW graus) para radianos CW (coords de tela)
+    minutiae[:, 2] = (-np.deg2rad(minutiae[:, 2])) % (2 * np.pi)
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
 

@@ -73,6 +73,7 @@ def infer_command(args):
     print(f"Unmodulated: {args.unmodulated}")
     print(f"Full Extr.:  {args.full}")
     print(f"FineNet:     {args.finenet}")
+    print(f"Profile:     {args.profile}")
     print(f"{'=' * 70}\n")
 
     run_inference(
@@ -93,6 +94,7 @@ def infer_command(args):
         unmodulated=args.unmodulated,
         full=args.full,
         use_finenet=args.finenet,
+        profile=args.profile,
     )
 
 
@@ -196,6 +198,8 @@ Examples:
                         help='Export unmodulated orientation, enhanced, and minutiae')
         sp.add_argument('--full', action='store_true',
                         help='Full extraction: all outputs plus quality mask and unmodulated')
+        sp.add_argument('--profile', action='store_true',
+                help='Enable detailed per-stage profiling and show metrics in tqdm')
 
     if any(h in sys.argv for h in ('-h', '--help')) and not any(cmd in sys.argv for cmd in subcommand_names):
         subparsers_temp = parser.add_subparsers(dest='command', required=False, help='Command to execute')
