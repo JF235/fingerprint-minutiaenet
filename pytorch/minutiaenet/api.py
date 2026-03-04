@@ -21,8 +21,8 @@ from .mnet_utils import get_minutiaenet_logger, MnetTimer, DEFAULT_COARSENET_WEI
 
 logger = get_minutiaenet_logger('minutiaenet.api', level=logging.DEBUG)
 
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
+torch.backends.cuda.matmul.fp32_precision = "tf32"
+torch.backends.cudnn.conv.fp32_precision = "tf32"
 
 
 def _init_profile_metrics() -> dict[str, deque]:
@@ -290,6 +290,7 @@ def postprocess_and_save_batch(
     input_base_path: str = None,
     quality_mask: bool = False,
     unmodulated: bool = False,
+    threshold: float = 0.45,
 ):
     """Post-process and save results for a batch."""
     worker_id = threading.get_ident()
@@ -297,7 +298,7 @@ def postprocess_and_save_batch(
                 extra={'cpu_worker_id': worker_id, 'first_image': os.path.basename(batch_paths[0])})
     try:
         with MnetTimer("Post-processing", logger):
-            final_outputs = postprocess(raw_outputs_cpu, threshold=0.45,
+            final_outputs = postprocess(raw_outputs_cpu, threshold=threshold,
                                         quality_mask=quality_mask, unmodulated=unmodulated)
 
         for i in range(len(batch_paths)):
@@ -380,6 +381,7 @@ def run_inference(
     num_workers: int = 4,
     recursive: bool = True,
     mnt_degrees: bool = True,
+    threshold: float = 0.45,
     compile_model: bool = False,
     max_image_dim: int = 1024,
     strategy: str = 'hybrid',
@@ -651,6 +653,7 @@ class InferenceRunner:
                         self.config.get('input_base_path'),
                         self.config.get('quality_mask', False),
                         self.config.get('unmodulated', False),
+                        self.config.get('threshold', 0.45),
                     )
                     futures.append(future)
                     submit_ms = (time.perf_counter() - t_submit_start) * 1000.0
@@ -748,7 +751,7 @@ class InferenceRunner:
                         t_post_start = time.perf_counter()
                         final_outputs, post_breakdown = postprocess(
                             raw_outputs,
-                            threshold=0.45,
+                            threshold=self.config.get('threshold', 0.45),
                             quality_mask=_qm,
                             unmodulated=_um,
                             return_timings=True,
@@ -758,7 +761,7 @@ class InferenceRunner:
                         finenet_ms = 0.0
                         if _uf and self.model.finenet is not None:
                             t_fine_start = time.perf_counter()
-                            final_outputs = self.model._apply_finenet(padded_tensors, final_outputs, threshold=0.45)
+                            final_outputs = self.model._apply_finenet(padded_tensors, final_outputs, threshold=self.config.get('threshold', 0.45))
                             finenet_ms = (time.perf_counter() - t_fine_start) * 1000.0
                     else:
                         final_outputs = self.model(batch_tensors, quality_mask=_qm, unmodulated=_um, use_finenet=_uf)
