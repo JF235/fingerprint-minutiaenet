@@ -128,7 +128,7 @@ class FingerprintDataset(Dataset):
             return None
 
 
-def find_image_paths(input_path: str, recursive: bool = False) -> list[str]:
+def find_image_paths(input_path: str, recursive: bool = True) -> list[str]:
     """Find all image paths from input."""
     image_paths = []
 
@@ -194,7 +194,7 @@ def dynamic_padding_collate(batch):
     return batch_tensors, batch_paths, batch_orig_shapes
 
 
-def save_results(result_item: dict, output_path: str, mnt_degrees: bool = False,
+def save_results(result_item: dict, output_path: str, mnt_degrees: bool = True,
                  input_base_path: str = None):
     """Save inference results to disk."""
     input_path = result_item["input_path"]
@@ -378,7 +378,7 @@ def run_inference(
     gpus: int | list[int] | None = None,
     batch_size: int = 4,
     num_workers: int = 4,
-    recursive: bool = False,
+    recursive: bool = True,
     mnt_degrees: bool = True,
     compile_model: bool = False,
     max_image_dim: int = 1024,

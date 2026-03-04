@@ -185,8 +185,8 @@ Examples:
         sp.add_argument('--finenet', action='store_true', help='Use FineNet for minutiae verification')
         sp.add_argument('-b', '--batch-size', type=int, default=4, help='Batch size per GPU (default: 4)')
         sp.add_argument('--cores', type=int, default=4, help='CPU cores for data loading per GPU (default: 4)')
-        sp.add_argument('--recursive', '-r', action='store_true', help='Search for images recursively')
-        sp.add_argument('--degrees', action='store_true', help='Save minutiae angles in degrees')
+        sp.add_argument('--recursive', '-r', action='store_true', default=True, help='Search for images recursively (default: on)')
+        sp.add_argument('--degrees', action='store_true', default=True, help='Save minutiae angles in degrees (default: on)')
         sp.add_argument('--compile', action='store_true', help='Compile model with torch.compile (experimental)')
         sp.add_argument('--max-dim', type=int, default=1024, help='Max image dimension before resizing (default: 1024)')
         sp.add_argument('--strategy', type=str, default='full_gpu', choices=['hybrid', 'full_gpu'],
